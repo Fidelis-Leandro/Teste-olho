@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Teste MediaPipe Olhos</title>
+<style>
+  :root { --bg:#0e1116; --fg:#e8eaed; --muted:#9aa0a6; --acc:#22c55e; --acc2:#38bdf8; --warn:#f59e0b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:system-ui,-apple-system,sans-serif; padding:12px; }
+  h1 { font-size:16px; margin:0 0 8px; }
+  #stage { position:relative; width:100%; max-width:640px; margin:0 auto; background:#000; border-radius:10px; overflow:hidden; }
+  #video, #overlay { width:100%; display:block; }
+  #overlay { position:absolute; inset:0; height:100%; }
+  .mirror { transform:scaleX(-1); }
+  #controls { display:flex; gap:8px; max-width:640px; margin:10px auto; }
+  button { flex:1; padding:12px; font-size:15px; border:0; border-radius:8px; background:#2b313b; color:var(--fg); }
+  button.primary { background:var(--acc); color:#000; font-weight:600; }
+  #stats { max-width:640px; margin:0 auto; font:13px/1.5 ui-monospace,monospace; color:var(--muted); white-space:pre; overflow-x:auto; }
+  #plot { width:100%; max-width:640px; height:140px; display:block; margin:8px auto; background:#161b22; border-radius:8px; }
+  .legend { max-width:640px; margin:0 auto; font-size:12px; color:var(--muted); }
+  .legend b.l { color:var(--acc); } .legend b.r { color:var(--acc2); } .legend b.k { color:var(--warn); }
+</style>
+</head>
+<body>
+<h1>MediaPipe – rastreamento dos olhos (MVP)</h1>
+
+<div id="stage">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div id="controls">
+  <button id="start" class="primary">Iniciar câmera</button>
+  <button id="flip">Trocar câmera</button>
+</div>
+
+<div id="stats">Carregando modelo…</div>
+<canvas id="plot"></canvas>
+<div class="legend">Posição horizontal da íris (0 = canto interno/externo, 1 = oposto):
+  <b class="l">olho esq.</b> · <b class="r">olho dir.</b> · <b class="k">piscada</b> — últimos 5 s</div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver, DrawingUtils }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const video = document.getElementById("video");
+const overlay = document.getElementById("overlay");
+const ctx = overlay.getContext("2d");
+const plot = document.getElementById("plot");
+const pctx = plot.getContext("2d");
+const stats = document.getElementById("stats");
+const startBtn = document.getElementById("start");
+const flipBtn = document.getElementById("flip");
+const draw = new DrawingUtils(ctx);
+
+let landmarker = null, stream = null, facing = "user", running = false;
+let lastVideoTime = -1, frames = 0, fpsT0 = performance.now(), fps = 0, camFps = "?";
+const history = []; // {t, l, r, blink}
+const WINDOW_MS = 5000;
+
+// ---------- modelo ----------
+async function loadModel() {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const opts = (delegate) => ({
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+      delegate
+    },
+    runningMode: "VIDEO",
+    numFaces: 1,
+    outputFaceBlendshapes: true
+  });
+  try {
+    landmarker = await FaceLandmarker.createFromOptions(fileset, opts("GPU"));
+    return "GPU";
+  } catch (e) {
+    landmarker = await FaceLandmarker.createFromOptions(fileset, opts("CPU"));
+    return "CPU";
+  }
+}
+let delegateUsed = "?";
+loadModel().then(d => { delegateUsed = d; stats.textContent = `Modelo pronto (${d}). Toque em "Iniciar câmera".`; })
+           .catch(e => { stats.textContent = "Erro ao carregar modelo: " + e; });
+
+// ---------- câmera ----------
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60 } }
+  });
+  video.srcObject = stream;
+  await video.play();
+  const s = stream.getVideoTracks()[0].getSettings();
+  camFps = s.frameRate ? s.frameRate.toFixed(0) : "?";
+  const mirror = facing === "user";
+  video.classList.toggle("mirror", mirror);
+  overlay.classList.toggle("mirror", mirror);
+  if (!running) { running = true; requestAnimationFrame(loop); }
+}
+
+startBtn.onclick = async () => {
+  if (!landmarker) { stats.textContent = "Aguarde o modelo carregar…"; return; }
+  try { await startCamera(); startBtn.textContent = "Reiniciar"; }
+  catch (e) { stats.textContent = "Erro na câmera: " + e.message + "\n(precisa de HTTPS e permissão)"; }
+};
+flipBtn.onclick = async () => {
+  facing = facing === "user" ? "environment" : "user";
+  if (stream) { try { await startCamera(); } catch (e) { stats.textContent = "Erro: " + e.message; } }
+};
+
+// ---------- utilidades ----------
+// Cantos dos olhos (índices da malha facial) e centros da íris
+const R_CORNERS = [33, 133], L_CORNERS = [362, 263];
+const R_IRIS = 468, L_IRIS = 473;
+
+function ratio(lm, iris, [a, b]) {
+  const dx = lm[b].x - lm[a].x, dy = lm[b].y - lm[a].y;
+  const len2 = dx * dx + dy * dy;
+  return ((lm[iris].x - lm[a].x) * dx + (lm[iris].y - lm[a].y) * dy) / len2; // projeção no eixo do olho
+}
+const bs = (cats, name) => (cats.find(c => c.categoryName === name) || {}).score ?? 0;
+
+// ---------- loop ----------
+function loop() {
+  if (!running) return;
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    if (overlay.width !== video.videoWidth) {
+      overlay.width = video.videoWidth; overlay.height = video.videoHeight;
+    }
+    const now = performance.now();
+    const t0 = performance.now();
+    const res = landmarker.detectForVideo(video, now);
+    const infMs = performance.now() - t0;
+
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+    frames++;
+    if (now - fpsT0 >= 1000) { fps = frames * 1000 / (now - fpsT0); frames = 0; fpsT0 = now; }
+
+    if (res.faceLandmarks && res.faceLandmarks.length) {
+      const lm = res.faceLandmarks[0];
+      const lw = Math.max(1.5, overlay.width / 400);
+      draw.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE, { color: "#38bdf8", lineWidth: lw });
+      draw.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_LEFT_EYE,  { color: "#22c55e", lineWidth: lw });
+      draw.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_RIGHT_IRIS, { color: "#f43f5e", lineWidth: lw });
+      draw.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_LEFT_IRIS,  { color: "#f43f5e", lineWidth: lw });
+      draw.drawLandmarks([lm[R_IRIS], lm[L_IRIS]], { color: "#fff", radius: lw * 1.5 });
+
+      const r = ratio(lm, R_IRIS, R_CORNERS);
+      const l = ratio(lm, L_IRIS, L_CORNERS);
+      const cats = res.faceBlendshapes?.[0]?.categories || [];
+      const blink = Math.max(bs(cats, "eyeBlinkLeft"), bs(cats, "eyeBlinkRight"));
+      history.push({ t: now, l, r, blink });
+
+      stats.textContent =
+        `FPS proc: ${fps.toFixed(1)} | câmera: ${camFps} fps | inferência: ${infMs.toFixed(1)} ms (${delegateUsed})\n` +
+        `Res: ${video.videoWidth}x${video.videoHeight}\n` +
+        `Íris esq: x=${(lm[L_IRIS].x).toFixed(3)} y=${(lm[L_IRIS].y).toFixed(3)} | razão=${l.toFixed(3)}\n` +
+        `Íris dir: x=${(lm[R_IRIS].x).toFixed(3)} y=${(lm[R_IRIS].y).toFixed(3)} | razão=${r.toFixed(3)}\n` +
+        `Piscada: ${blink.toFixed(2)}`;
+    } else {
+      stats.textContent = `FPS proc: ${fps.toFixed(1)} | inferência: ${infMs.toFixed(1)} ms\nNenhum rosto detectado`;
+    }
+    while (history.length && now - history[0].t > WINDOW_MS) history.shift();
+    drawPlot(now);
+  }
+  requestAnimationFrame(loop);
+}
+
+function drawPlot(now) {
+  const dpr = window.devicePixelRatio || 1;
+  const W = plot.clientWidth * dpr, H = plot.clientHeight * dpr;
+  if (plot.width !== W) { plot.width = W; plot.height = H; }
+  pctx.clearRect(0, 0, W, H);
+  pctx.strokeStyle = "#2b313b"; pctx.lineWidth = 1;
+  [0.25, 0.5, 0.75].forEach(v => { pctx.beginPath(); pctx.moveTo(0, H * v); pctx.lineTo(W, H * v); pctx.stroke(); });
+  const xOf = t => W - ((now - t) / WINDOW_MS) * W;
+  const yOf = v => H - Math.min(Math.max(v, 0), 1) * H;
+  const line = (key, color) => {
+    pctx.strokeStyle = color; pctx.lineWidth = 2 * dpr; pctx.beginPath();
+    history.forEach((p, i) => { const x = xOf(p.t), y = yOf(p[key]); i ? pctx.lineTo(x, y) : pctx.moveTo(x, y); });
+    pctx.stroke();
+  };
+  line("blink", "#f59e0b");
+  line("l", "#22c55e");
+  line("r", "#38bdf8");
+}
+</script>
+</body>
+</html>
