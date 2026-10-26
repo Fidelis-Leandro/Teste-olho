@@ -16,6 +16,12 @@
   #controls { display:flex; gap:8px; max-width:640px; margin:10px auto; }
   button { flex:1; padding:12px; font-size:15px; border:0; border-radius:8px; background:#2b313b; color:var(--fg); }
   button.primary { background:var(--acc); color:#000; font-weight:600; }
+  #blinkBox { display:flex; gap:8px; max-width:640px; margin:0 auto 10px; align-items:stretch; }
+  #blinkBox > div { flex:1; background:#161b22; border-radius:8px; padding:8px; text-align:center; }
+  #blinkBox span { display:block; font-size:28px; font-weight:700; color:var(--warn); font-variant-numeric:tabular-nums; }
+  #blinkBox small { color:var(--muted); font-size:11px; }
+  #blinkBox button { flex:0 0 auto; padding:0 14px; }
+  #blinkBox.closed > div:first-child { outline:2px solid var(--warn); }
   #stats { max-width:640px; margin:0 auto; font:13px/1.5 ui-monospace,monospace; color:var(--muted); white-space:pre; overflow-x:auto; }
   #plot { width:100%; max-width:640px; height:140px; display:block; margin:8px auto; background:#161b22; border-radius:8px; }
   .legend { max-width:640px; margin:0 auto; font-size:12px; color:var(--muted); }
@@ -33,6 +39,13 @@
 <div id="controls">
   <button id="start" class="primary">Iniciar câmera</button>
   <button id="flip">Trocar câmera</button>
+</div>
+
+<div id="blinkBox">
+  <div><span id="blinkCount">0</span><small>piscadas</small></div>
+  <div><span id="blinkRate">–</span><small>por minuto</small></div>
+  <div><span id="blinkDur">–</span><small>última (ms)</small></div>
+  <button id="reset">Zerar</button>
 </div>
 
 <div id="stats">Carregando modelo…</div>
@@ -58,6 +71,37 @@ let landmarker = null, stream = null, facing = "user", running = false;
 let lastVideoTime = -1, frames = 0, fpsT0 = performance.now(), fps = 0, camFps = "?";
 const history = []; // {t, l, r, blink}
 const WINDOW_MS = 5000;
+
+// ---------- contador de piscadas (histerese para não contar duas vezes) ----------
+const BLINK_ON = 0.5, BLINK_OFF = 0.3;
+let eyeClosed = false, closedAt = 0, blinkCount = 0, blinkTimes = [], countStart = performance.now();
+const blinkBox = document.getElementById("blinkBox");
+const elCount = document.getElementById("blinkCount");
+const elRate = document.getElementById("blinkRate");
+const elDur = document.getElementById("blinkDur");
+
+function updateBlink(score, now) {
+  if (!eyeClosed && score > BLINK_ON) { eyeClosed = true; closedAt = now; }
+  else if (eyeClosed && score < BLINK_OFF) {
+    eyeClosed = false;
+    const dur = now - closedAt;
+    if (dur < 1000) { // fechar por mais de 1 s não conta como piscada
+      blinkCount++; blinkTimes.push(now);
+      elCount.textContent = blinkCount;
+      elDur.textContent = dur.toFixed(0);
+    }
+  }
+  blinkBox.classList.toggle("closed", eyeClosed);
+  // taxa: piscadas no último minuto (ou desde o início, se ainda não passou 1 min)
+  blinkTimes = blinkTimes.filter(t => now - t <= 60000);
+  const elapsed = Math.min(now - countStart, 60000);
+  if (elapsed > 5000) elRate.textContent = (blinkTimes.length * 60000 / elapsed).toFixed(0);
+}
+
+document.getElementById("reset").onclick = () => {
+  blinkCount = 0; blinkTimes = []; countStart = performance.now(); eyeClosed = false;
+  elCount.textContent = "0"; elRate.textContent = "–"; elDur.textContent = "–";
+};
 
 // ---------- modelo ----------
 async function loadModel() {
@@ -154,6 +198,7 @@ function loop() {
       const cats = res.faceBlendshapes?.[0]?.categories || [];
       const blink = Math.max(bs(cats, "eyeBlinkLeft"), bs(cats, "eyeBlinkRight"));
       history.push({ t: now, l, r, blink });
+      updateBlink(blink, now);
 
       stats.textContent =
         `FPS proc: ${fps.toFixed(1)} | câmera: ${camFps} fps | inferência: ${infMs.toFixed(1)} ms (${delegateUsed})\n` +
